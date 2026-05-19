@@ -1,4 +1,4 @@
-# Maintainer: Zain Khan <zai1208>
+# Maintainer: Zain Khan <zai1208@protonmail.com>
 pkgname=pwss-fetch-https-git
 pkgver=0.1.0
 pkgrel=1
