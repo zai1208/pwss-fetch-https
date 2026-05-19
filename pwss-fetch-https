@@ -1,1 +1,37 @@
+#!/usr/bin/env bash
 
+# Usage: ./pwss-fetch-https zai1208/mobile-setup
+INPUT="$1"
+REG_URL="https://blog.zain-khan.dev/registry.json.asc"
+
+# 1. Split handle and path
+IFS='/' read -r HANDLE PATH_NAME <<<"$INPUT"
+
+# 2. Get the Manifest URL and Fingerprint from the Global Registry
+# We decrypt the registry once
+REG_DATA=$(curl -s "$REG_URL" | gpg --decrypt 2>/dev/null)
+MANIFEST_URL=$(echo "$REG_DATA" | jq -r ".handles.\"$HANDLE\".location")
+FPR=$(echo "$REG_DATA" | jq -r ".handles.\"$HANDLE\".fpr")
+
+if [[ "$MANIFEST_URL" == "null" ]]; then
+  echo "⚠️  ERROR: Handle '$HANDLE' not found." >&2
+  exit 1
+fi
+
+# 3. Resolve the Final Content URL
+if [[ -z "$PATH_NAME" ]]; then
+  # No path? Get the 'root_content' from the manifest
+  FINAL_URL=$(curl -sL "$MANIFEST_URL" | gpg --decrypt 2>/dev/null | jq -r ".root_content")
+else
+  # Path exists? Look it up in the manifest 'paths' object
+  FINAL_URL=$(curl -sL "$MANIFEST_URL" | gpg --decrypt 2>/dev/null | jq -r ".paths.\"$PATH_NAME\"")
+fi
+
+# 4. Final Validation
+if [[ "$FINAL_URL" == "null" ]]; then
+  echo "⚠️  ERROR: Path '$PATH_NAME' not found in $HANDLE's manifest." >&2
+  exit 1
+fi
+
+# 5. Output the result for the next pipe (pwss-core)
+echo "$FINAL_URL $FPR"
