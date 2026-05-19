@@ -1,37 +1,226 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
-# Usage: ./pwss-fetch-https zai1208/mobile-setup
-INPUT="$1"
+# ==============================================================================
+# CONFIGURATION & ENVIRONMENT INITIALIZATION
+# ==============================================================================
 REG_URL="https://blog.zain-khan.dev/registry.json.asc"
+LOCAL_REGISTRY_CACHE="${XDG_DATA_HOME:-$HOME/.local/share}/pwss/registry.json.asc"
+TRUSTED_KEYS_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/pwss/trusted_keys"
+PETNAMES_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/pwss/petnames.conf"
 
-# 1. Split handle and path
-IFS='/' read -r HANDLE PATH_NAME <<<"$INPUT"
+# Setup global ephemeral staging environment (prevents overlapping trap cleanups)
+STAGE_DIR=$(mktemp -d)
+trap 'rm -rf "$STAGE_DIR"' EXIT
 
-# 2. Get the Manifest URL and Fingerprint from the Global Registry
-# We decrypt the registry once
-REG_DATA=$(curl -s "$REG_URL" | gpg --decrypt 2>/dev/null)
-MANIFEST_URL=$(echo "$REG_DATA" | jq -r ".handles.\"$HANDLE\".location")
-FPR=$(echo "$REG_DATA" | jq -r ".handles.\"$HANDLE\".fpr")
+# Ensure local asset paths exist safely
+mkdir -p "$(dirname "$LOCAL_REGISTRY_CACHE")"
+mkdir -p "$TRUSTED_KEYS_DIR"
 
-if [[ "$MANIFEST_URL" == "null" ]]; then
-  echo "⚠️  ERROR: Handle '$HANDLE' not found." >&2
+# ==============================================================================
+# ROUTING UTILITIES
+# ==============================================================================
+# Matches your exact disk schema: .handles -> .location & .fpr
+query_registry_entry() {
+  local json_file="$1"
+  local auth="$2"
+  jq -r --arg a "$auth" '.handles[$a] | select(. != null) | "site \(.location) \(.fpr)"' "$json_file" 2>/dev/null || true
+}
+
+# Extracts targeted assets from decrypted manifest documents
+resolve_manifest_target() {
+  local manifest_json="$1"
+  local raw_path="$2"
+  local clean_path="${raw_path#/}" # Strip leading slash to match flat keys
+
+  if [[ -z "$clean_path" ]]; then
+    jq -r '.root_content // select(. != null)' "$manifest_json" 2>/dev/null || true
+  else
+    jq -r --arg p "$clean_path" '.paths[$p] | select(. != null)' "$manifest_json" 2>/dev/null || true
+  fi
+}
+
+# Cryptographically authenticates and processes a cleartext-signed manifest
+process_manifest_payload() {
+  local manifest_url="$1"
+  local expected_fpr="$2"
+  local path_query="$3"
+  local step_prefix="$4"
+
+  local asc_working="$STAGE_DIR/manifest_work.json.asc"
+  local json_working="$STAGE_DIR/manifest_work.json"
+
+  if ! curl -sSf "$manifest_url" -o "$asc_working"; then
+    echo "[$step_prefix] [ERROR] Failed to fetch target site manifest from remote network." >&2
+    return 1
+  fi
+
+  # Cryptographic Identity Pinned Invariant Check
+  if ! gpg --status-fd 1 --verify "$asc_working" 2>/dev/null | grep -q "VALIDSIG $expected_fpr"; then
+    echo "[$step_prefix] [SECURITY CRISIS] Manifest signature is INVALID or spoofed!" >&2
+    return 1
+  fi
+
+  # Strip ASCII Armor
+  if ! gpg --output "$json_working" --decrypt "$asc_working" 2>/dev/null; then
+    echo "[$step_prefix] [ERROR] Could not strip ASCII armor layer from verified manifest payload." >&2
+    return 1
+  fi
+
+  # Locate source mapping
+  local target_src
+  target_src=$(resolve_manifest_target "$json_working" "$path_query")
+
+  if [[ -z "$target_src" || "$target_src" == "null" ]]; then
+    echo "[$step_prefix] [404] Resource path Key matching failed inside specified manifest context." >&2
+    return 1
+  fi
+
+  # Handoff interface out to browser orchestrator
+  echo "$target_src $expected_fpr"
+  return 0
+}
+
+# ==============================================================================
+# INPUT PARSING & BOUND TRACKING
+# ==============================================================================
+RAW_INPUT="${1:-}"
+if [[ -z "$RAW_INPUT" ]]; then
+  echo "Usage: $0 pwss://<authority>/<path> or <authority>/<path>" >&2
   exit 1
 fi
 
-# 3. Resolve the Final Content URL
-if [[ -z "$PATH_NAME" ]]; then
-  # No path? Get the 'root_content' from the manifest
-  FINAL_URL=$(curl -sL "$MANIFEST_URL" | gpg --decrypt 2>/dev/null | jq -r ".root_content")
+URI="${RAW_INPUT#pwss://}"
+
+if [[ "$URI" == *"/"* ]]; then
+  AUTHORITY="${URI%%/*}"
+  SITE_PATH="/${URI#*/}"
 else
-  # Path exists? Look it up in the manifest 'paths' object
-  FINAL_URL=$(curl -sL "$MANIFEST_URL" | gpg --decrypt 2>/dev/null | jq -r ".paths.\"$PATH_NAME\"")
+  AUTHORITY="$URI"
+  SITE_PATH="/"
 fi
 
-# 4. Final Validation
-if [[ "$FINAL_URL" == "null" ]]; then
-  echo "⚠️  ERROR: Path '$PATH_NAME' not found in $HANDLE's manifest." >&2
+ORIGINAL_REQUEST="$AUTHORITY"
+IS_PETNAME=0
+
+# ==============================================================================
+# TIER 1: PRIVATE LOCAL ALIAS RESOLUTION
+# ==============================================================================
+if [[ -f "$PETNAMES_FILE" ]]; then
+  PETNAME_MATCH=$(grep -v '^#' "$PETNAMES_FILE" | awk -v auth="$AUTHORITY" '$1 == auth {print $2}' || true)
+
+  if [[ -n "$PETNAME_MATCH" ]]; then
+    echo "[PWSS] [Tier 1] Local petname hit: '$AUTHORITY' -> '$PETNAME_MATCH'" >&2
+    IS_PETNAME=1
+    if [[ "$PETNAME_MATCH" == *"/"* ]]; then
+      AUTHORITY="${PETNAME_MATCH%%/*}"
+      if [[ "$SITE_PATH" == "/" ]]; then
+        SITE_PATH="/${PETNAME_MATCH#*/}"
+      else
+        SITE_PATH="/${PETNAME_MATCH#*/}${SITE_PATH}"
+      fi
+    else
+      AUTHORITY="$PETNAME_MATCH"
+    fi
+  fi
+fi
+
+# ==============================================================================
+# TIER 2: AUTHORITATIVE GLOBAL MIRROR LOOKUP
+# ==============================================================================
+echo "[PWSS] Synchronizing global root registry from mirror..." >&2
+HAS_CORE_LEDGER=0
+
+if curl -sSf "$REG_URL" -o "$STAGE_DIR/registry.json.asc"; then
+  cp "$STAGE_DIR/registry.json.asc" "$LOCAL_REGISTRY_CACHE"
+  HAS_CORE_LEDGER=1
+elif [[ -f "$LOCAL_REGISTRY_CACHE" ]]; then
+  echo "[PWSS] [WARNING] Mirror offline. Falling back onto cached local immutable root ledger ledger." >&2
+  cp "$LOCAL_REGISTRY_CACHE" "$STAGE_DIR/registry.json.asc"
+  HAS_CORE_LEDGER=1
+fi
+
+if ((HAS_CORE_LEDGER == 1)); then
+  if gpg --output "$STAGE_DIR/registry.json" --decrypt "$STAGE_DIR/registry.json.asc" 2>/dev/null; then
+    ROOT_MATCH=$(query_registry_entry "$STAGE_DIR/registry.json" "$AUTHORITY")
+
+    if [[ -n "$ROOT_MATCH" ]]; then
+      read -r TYPE EN_URL FINGERPRINT <<<"$ROOT_MATCH"
+      echo "[PWSS] [Tier 2] Authoritative global match found ($TYPE)" >&2
+
+      if [[ "$TYPE" == "site" ]]; then
+        if process_manifest_payload "$EN_URL" "$FINGERPRINT" "$SITE_PATH" "PWSS"; then
+          exit 0
+        else
+          exit 1
+        fi
+      elif [[ "$TYPE" == "registry_pointer" ]]; then
+        echo "[PWSS] Direct nested pointer resolution skipped via core tier." >&2
+        exit 1
+      fi
+    fi
+  else
+    echo "[PWSS] [ERROR] Global registry ledger integrity compromise: Decryption failed." >&2
+    exit 1
+  fi
+fi
+
+# ==============================================================================
+# TIER 3: FEDERATED SUBNET FALLBACK SCANNING
+# ==============================================================================
+if ((IS_PETNAME == 1)); then
+  echo "[PWSS] [404] Protocol Error: Sovereign local petname pointer mapped to authority '$AUTHORITY', but it is missing globally." >&2
   exit 1
 fi
 
-# 5. Output the result for the next pipe (pwss-core)
-echo "$FINAL_URL $FPR"
+echo "[PWSS] Missed Tier 1 & Tier 2. Initiating Peer Subnet search scanning..." >&2
+
+FOUND_SUBNET_URL=""
+FOUND_SUBNET_FPR=""
+FOUND_COUNT=0
+
+# Scan local directory space for crypto-signed peer collections
+for subnet_asc in "$TRUSTED_KEYS_DIR"/*.json.asc; do
+  [[ -e "$subnet_asc" ]] || continue
+  peer_name=$(basename "$subnet_asc" .json.asc)
+
+  # Decrypt transient files inside isolated volatile container space
+  if ! gpg --output "$STAGE_DIR/$peer_name.json" --decrypt "$subnet_asc" 2>/dev/null; then
+    echo "[PWSS] [WARNING] Core verification failed on peer subnet tracking index: $peer_name. Skipping." >&2
+    continue
+  fi
+
+  # Scan the decrypted peer list using original un-mutated token name
+  SUB_MATCH=$(query_registry_entry "$STAGE_DIR/$peer_name.json" "$ORIGINAL_REQUEST")
+
+  if [[ -n "$SUB_MATCH" ]]; then
+    read -r SUB_TYPE SUB_URL SUB_FINGERPRINT <<<"$SUB_MATCH"
+
+    FOUND_SUBNET_URL="$SUB_URL"
+    FOUND_SUBNET_FPR="$SUB_FINGERPRINT"
+    FOUND_COUNT=$((FOUND_COUNT + 1))
+
+    # INTERACTION ARREST: AMBIGUITY HALT ENFORCED
+    if ((FOUND_COUNT > 1)); then
+      echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+      echo "[PWSS] [FATAL EXCEPTION] AMBIGUOUS NAMESPACE DETECTED" >&2
+      echo "The requested identity shortcut 'pwss://$ORIGINAL_REQUEST' is claimed" >&2
+      echo "simultaneously across independent trusted peer registries." >&2
+      echo "To mitigate routing spoof vectors, you must resolve via explicit scoping." >&2
+      echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+      exit 1
+    fi
+  fi
+done
+
+if ((FOUND_COUNT == 1)); then
+  echo "[PWSS] [Tier 3] Identity mapped successfully through federated subnet." >&2
+  if process_manifest_payload "$FOUND_SUBNET_URL" "$FOUND_SUBNET_FPR" "$SITE_PATH" "PWSS-SUBNET"; then
+    exit 0
+  else
+    exit 1
+  fi
+fi
+
+echo "[PWSS] [404] Protocol Resolution Error: Absolute namespace exhaustive failure across all 3 Tiers." >&2
+exit 1
